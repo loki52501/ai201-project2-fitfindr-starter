@@ -64,60 +64,75 @@ wardrobe = get_example_wardrobe()
 
 ## Tool Inventory
 
-Your README submission must document each tool's name, inputs, and return value. **These must exactly match your actual function signatures in `tools.py`.** Your documented interfaces will be checked against your actual function signatures in `tools.py` — if the parameter count or types contradict what's in the code, you may not receive full credit for that tool.
+| Tool | Inputs | Return value |
+|------|--------|--------------|
+| `search_listings` | `description: str`, `size: str = None`, `max_price: float = None` | `list[dict]` — up to 5 matching listings, each with: `id`, `title`, `description`, `category`, `style_tags`, `size`, `condition`, `price`, `colors`, `brand`, `platform`. Empty list if no matches. |
+| `suggest_outfit` | `new_item: dict`, `wardrobe: dict` | `dict` with keys: `outfit_pieces` (list of wardrobe item name strings), `styling_notes` (str explaining the pairing). |
+| `create_fit_card` | `outfit: dict`, `new_item: dict` | `str` — a markdown-formatted fit card with the item info, outfit pieces, styling notes, and a vibe description. |
 
 ---
 
 ## Interaction Walkthrough
 
-<!-- Walk through a complete interaction step by step: natural language query → each tool call (and why) → final fit card.
-     Walk through this carefully — it's how graders follow your agent's reasoning without a live demo.
-     Use a specific example — do not leave this as a template. -->
-
-**User query:**
+**User query:** "I'm looking for a vintage graphic tee under $30. I mostly wear baggy jeans and chunky sneakers."
 
 **Step 1 — Tool called:**
-- Tool:
-- Input:
-- Why this tool:
-- Output:
+- Tool: `search_listings`
+- Input: `description="vintage graphic tee"`, `max_price=30.0`
+- Why this tool: The user named an item type and a price ceiling — search_listings filters the dataset by both keyword match and price before any LLM call is made.
+- Output: `[{"id": "lst_002", "title": "Y2K Baby Tee — Butterfly Print", "price": 18.0, "style_tags": ["y2k", "vintage", "graphic tee", "cottagecore"], "colors": ["white", "pink", "purple"], "platform": "depop", ...}, ...]`
 
 **Step 2 — Tool called:**
-- Tool:
-- Input:
-- Why this tool:
-- Output:
+- Tool: `suggest_outfit`
+- Input: `new_item={"title": "Y2K Baby Tee — Butterfly Print", "style_tags": ["y2k", "vintage", "graphic tee"], "colors": ["white", "pink", "purple"], "category": "tops", ...}`, `wardrobe=<example_wardrobe>`
+- Why this tool: The agent has a candidate item and needs to connect it to the user's existing clothes. suggest_outfit sends both to the LLM and asks it to pick complementary wardrobe pieces.
+- Output: `{"outfit_pieces": ["Baggy straight-leg jeans, dark wash", "Chunky white sneakers"], "styling_notes": "Tuck the baby tee into the high-waisted jeans for a classic Y2K silhouette. The chunky sneakers keep it casual and grounded."}`
 
 **Step 3 — Tool called:**
-- Tool:
-- Input:
-- Why this tool:
-- Output:
+- Tool: `create_fit_card`
+- Input: `outfit={"outfit_pieces": [...], "styling_notes": "..."}`, `new_item={"title": "Y2K Baby Tee...", "price": 18.0, "platform": "depop", ...}`
+- Why this tool: The agent now has everything it needs to produce the final user-facing output — create_fit_card formats all of it into a styled markdown card.
+- Output: A markdown fit card (see Final output below).
 
 **Final output to user:**
+```
+# 👗 Y2K Baby Tee — Butterfly Print
+
+**💰 Price:** $18.00 · **📦 Platform:** Depop · **🏷️ Condition:** Excellent
+
+## ✨ The Fit
+- Baggy straight-leg jeans, dark wash
+- Chunky white sneakers
+
+## 💬 Styling Notes
+Tuck the baby tee into the high-waisted jeans for a classic Y2K silhouette.
+The chunky sneakers keep it casual and grounded.
+
+## 🎨 Vibe
+Nostalgic Y2K energy — effortless, fun, and perfectly throwback.
+```
 
 ---
 
 ## Error Handling and Fail Points
 
-<!-- For each tool, describe the specific failure mode and what your agent does in response.
-     This maps to the error handling section of the rubric (F5-C1). -->
-
 | Tool | Failure mode | Agent response |
 |------|-------------|----------------|
-| `search_listings` | | |
-| `suggest_outfit` | | |
-| `create_fit_card` | | |
+| `search_listings` | No listings match the query keywords, size, or price filter | Returns an empty list; the agent surfaces `"No listings found"` to the LLM, which tells the user no matches were found and suggests broadening the search (remove size filter, raise price, or try different keywords). |
+| `suggest_outfit` | Wardrobe is empty (`wardrobe.get("items", [])` is `[]`) or Groq API call fails | Returns `{"outfit_pieces": [], "styling_notes": "No wardrobe items available..."}` or `{"outfit_pieces": [], "styling_notes": "Could not generate outfit suggestion."}` — the agent passes this to `create_fit_card`, which falls back to a minimal item-only card. |
+| `create_fit_card` | Outfit dict has no pieces/notes, or Groq API call raises an exception | Falls back to a hardcoded markdown card built from listing fields only (title, price, platform, category, colors, style tags), so the user always receives a formatted response. |
 
 ---
 
 ## Spec Reflection
 
-<!-- Answer both questions with at least 2–3 sentences each. -->
-
 **One way planning.md helped during implementation:**
 
+Defining the exact return shape of `suggest_outfit` in planning.md — specifically that it returns a dict with `outfit_pieces` (list) and `styling_notes` (str) — made it straightforward to write `create_fit_card` independently. Without that contract written down first, the two functions would have required coordination mid-implementation. The planning doc acted as the interface agreement between tools, so each could be built and tested in isolation.
+
 **One divergence from your spec, and why:**
+
+The spec described the planning loop as having a human-in-the-loop pause after `search_listings` (the agent presents the top 3 results and asks the user to pick one before calling `suggest_outfit`). In the final implementation, the LLM automatically selects the best match from the returned list and proceeds without asking. This kept the interaction snappier for a chat UI context — requiring a selection step would have added friction and made the Gradio demo feel slow. The tradeoff is that the user doesn't explicitly choose, but the fit card still reflects a well-matched item.
 
 ---
 

@@ -1,123 +1,132 @@
-"""
-agent.py
-
-The FitFindr planning loop. Orchestrates the three tools in response to a
-natural language user query, passing state between them via a session dict.
-
-Complete tools.py and test each tool in isolation before implementing this file.
-
-Usage (once implemented):
-    from agent import run_agent
-    from utils.data_loader import get_example_wardrobe
-
-    result = run_agent(
-        query="vintage graphic tee under $30, size M",
-        wardrobe=get_example_wardrobe(),
-    )
-    print(result["fit_card"])
-    print(result["error"])   # None on success
-"""
-
+import json
+import os
+from dotenv import load_dotenv
+from groq import Groq
 from tools import search_listings, suggest_outfit, create_fit_card
 
+load_dotenv()
 
-# ── session state ─────────────────────────────────────────────────────────────
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-def _new_session(query: str, wardrobe: dict) -> dict:
+SYSTEM_PROMPT = (
+    "You are FitFindr, a friendly thrift shopping assistant. Help users find secondhand clothing "
+    "and style it with their wardrobe. When a user asks about finding something, use search_listings "
+    "first, then suggest_outfit with the best match, then create_fit_card to present the result. "
+    "Always use all three tools in sequence for a complete recommendation."
+)
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_listings",
+            "description": "Search secondhand listings by style/description keywords, size, and max price",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string", "description": "Style keywords, item type, aesthetic"},
+                    "size": {"type": "string", "description": "Size filter (optional)"},
+                    "max_price": {"type": "number", "description": "Maximum price filter (optional)"},
+                },
+                "required": ["description"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "suggest_outfit",
+            "description": "Suggest an outfit pairing a new thrifted item with pieces from the user's wardrobe",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "new_item": {
+                        "type": "object",
+                        "description": "The new thrifted item to style (a listing dict with keys like title, price, size, etc.)",
+                    },
+                },
+                "required": ["new_item"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_fit_card",
+            "description": "Generate a formatted markdown fit card summarizing the outfit recommendation",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "outfit": {
+                        "type": "object",
+                        "description": "Outfit dict with outfit_pieces and styling_notes keys",
+                    },
+                    "new_item": {
+                        "type": "object",
+                        "description": "The new thrifted item being featured",
+                    },
+                },
+                "required": ["outfit", "new_item"],
+            },
+        },
+    },
+]
+
+
+def run_agent(user_query: str, wardrobe: dict = None) -> str:
     """
-    Initialize and return a fresh session dict for one user interaction.
-
-    The session dict is the single source of truth for everything that happens
-    during a run — it stores the original query, parsed parameters, tool results,
-    and any error that caused early termination.
-
-    You may add fields to this dict as needed for your implementation.
+    Run the FitFindr agent for a single user query.
+    Returns the final response string (usually a fit card or error message).
     """
-    return {
-        "query": query,              # original user query
-        "parsed": {},                # extracted description / size / max_price
-        "search_results": [],        # list of matching listing dicts
-        "selected_item": None,       # top result, passed into suggest_outfit
-        "wardrobe": wardrobe,        # user's wardrobe dict
-        "outfit_suggestion": None,   # string returned by suggest_outfit
-        "fit_card": None,            # string returned by create_fit_card
-        "error": None,               # set if the interaction ended early
+    if wardrobe is None:
+        from utils.data_loader import get_example_wardrobe
+        wardrobe = get_example_wardrobe()
+
+    tool_map = {
+        "search_listings": search_listings,
+        "suggest_outfit": lambda **kwargs: suggest_outfit(kwargs["new_item"], wardrobe),
+        "create_fit_card": create_fit_card,
     }
 
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_query},
+    ]
 
-# ── planning loop ─────────────────────────────────────────────────────────────
+    for _ in range(6):
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
+        )
 
-def run_agent(query: str, wardrobe: dict) -> dict:
-    """
-    Main agent entry point. Runs the FitFindr planning loop for a single
-    user interaction and returns the completed session dict.
+        choice = response.choices[0]
+        messages.append(choice.message)
 
-    Args:
-        query:    Natural language user request
-                  (e.g., "vintage graphic tee under $30, size M")
-        wardrobe: User's wardrobe dict — use get_example_wardrobe() or
-                  get_empty_wardrobe() from utils/data_loader.py
+        if not choice.message.tool_calls:
+            return choice.message.content
 
-    Returns:
-        The session dict after the interaction completes. Check session["error"]
-        first — if it is not None, the interaction ended early and the other
-        output fields (outfit_suggestion, fit_card) will be None.
+        for tool_call in choice.message.tool_calls:
+            name = tool_call.function.name
+            args = json.loads(tool_call.function.arguments)
+            result = tool_map[name](**args)
 
-    TODO — implement this function using the planning loop you designed in planning.md:
+            # Surface empty search results explicitly so the LLM can respond helpfully
+            if name == "search_listings" and isinstance(result, list) and len(result) == 0:
+                result = "No listings found"
 
-        Step 1: Initialize the session with _new_session().
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": json.dumps(result),
+            })
 
-        Step 2: Parse the user's query to extract a description, size, and
-                max_price. You can use regex, string splitting, or ask the LLM
-                to parse it — document your choice in planning.md.
-                Store the result in session["parsed"].
+    return response.choices[0].message.content or "Unable to complete recommendation after maximum iterations."
 
-        Step 3: Call search_listings() with the parsed parameters.
-                Store results in session["search_results"].
-                If no results: set session["error"] to a helpful message and
-                return the session early. Do NOT proceed to suggest_outfit
-                with empty input.
-
-        Step 4: Select the item to use (e.g., the top result).
-                Store it in session["selected_item"].
-
-        Step 5: Call suggest_outfit() with the selected item and wardrobe.
-                Store the result in session["outfit_suggestion"].
-
-        Step 6: Call create_fit_card() with the outfit suggestion and selected item.
-                Store the result in session["fit_card"].
-
-        Step 7: Return the session.
-
-    Before writing code, complete the Planning Loop and State Management sections
-    of planning.md — your implementation should match what you described there.
-    """
-    # TODO: implement the planning loop
-    session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
-    return session
-
-
-# ── CLI test ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    from utils.data_loader import get_example_wardrobe, get_empty_wardrobe
-
-    print("=== Happy path: graphic tee ===\n")
-    session = run_agent(
-        query="looking for a vintage graphic tee under $30",
-        wardrobe=get_example_wardrobe(),
-    )
-    if session["error"]:
-        print(f"Error: {session['error']}")
-    else:
-        print(f"Found: {session['selected_item']['title']}")
-        print(f"\nOutfit: {session['outfit_suggestion']}")
-        print(f"\nFit card: {session['fit_card']}")
-
-    print("\n\n=== No-results path ===\n")
-    session2 = run_agent(
-        query="designer ballgown size XXS under $5",
-        wardrobe=get_example_wardrobe(),
-    )
-    print(f"Error message: {session2['error']}")
+    from utils.data_loader import get_example_wardrobe
+    wardrobe = get_example_wardrobe()
+    query = input("What are you looking for? ")
+    print(run_agent(query, wardrobe))
